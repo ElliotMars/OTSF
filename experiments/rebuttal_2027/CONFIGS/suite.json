@@ -1,0 +1,21 @@
+{
+  "lr_scales": [0.1, 0.3, 1.0, 3.0, 10.0],
+  "sensitivity": {
+    "alignment_threshold": [0.6, 0.7, 0.8, 0.9],
+    "memory_capacity": [8, 16, 32, 64],
+    "subspace_lambda": [100, 1000, 10000, 100000],
+    "adaptive_controller": ["dynamic", "fixed"]
+  },
+  "validity_modes": [
+    "full", "loss_only_gate_alignment_weighted", "pure_loss_only",
+    "high_align_guard_original_weight", "high_align_guard_weight_safe"
+  ],
+  "prospective_moe_budget": {"n_inner": 1, "rebuttal_moe_replay": 2},
+  "time_calibration_candidates": [
+    {"n_inner": 1, "rebuttal_moe_replay": 2},
+    {"n_inner": 1, "rebuttal_moe_replay": 4},
+    {"n_inner": 2, "rebuttal_moe_replay": 2},
+    {"n_inner": 2, "rebuttal_moe_replay": 4}
+  ],
+  "parameter_proxy_size": 128
+}

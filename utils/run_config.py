@@ -132,6 +132,12 @@ def validate_online_feedback_protocol(args: Any) -> str:
     mode = _online_learning_mode(args)
     if mode == "none":
         return "none_offline"
+    if getattr(args, "rebuttal_dsof_partial_td", False):
+        if (getattr(args, "method", None) != "dsof" or mode != "full"
+                or not getattr(args, "delay_fb", False) or getattr(args, "progressive_fb", False)
+                or getattr(args, "progressive_baseline_fb", False)):
+            raise ValueError("prospective DSOF partial TD requires the dsof delayed stream")
+        return "dsof_partial_td_adaptation"
     progressive_baseline = bool(
         getattr(args, "progressive_baseline_fb", False)
     )

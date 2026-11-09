@@ -54,7 +54,7 @@ class ExpStreamBaseline(Exp_Basic):
         )
         self.progressive_protocol_diagnostics = None
 
-    def _get_data(self, flag):
+    def _get_data(self, flag, *, online=False):
         mapping = defaultdict(lambda: Dataset_Custom, {
             "ETTh1": Dataset_ETT_hour, "ETTh2": Dataset_ETT_hour,
             "ETTm1": Dataset_ETT_minute, "ETTm2": Dataset_ETT_minute,
@@ -63,8 +63,12 @@ class ExpStreamBaseline(Exp_Basic):
             flag=flag, delay_fb=self.args.delay_fb,
             size=[self.args.seq_len, self.args.label_len, self.args.pred_len],
             features=self.args.features, target=self.args.target, inverse=self.args.inverse,
-            timeenc=2, freq=self.args.freq, cols=self.args.cols)
-        bsz = self.args.test_bsz if flag == "test" else self.args.batch_size
+            timeenc=2, freq=self.args.freq, cols=self.args.cols,
+            **({"split_mode": self.args.split_mode} if hasattr(self.args, "split_mode") and flag != "pred" else {}),
+            validation_source_rows=getattr(self.args, "online_validation_source_rows", None)
+            if online else None,
+        )
+        bsz = self.args.test_bsz if flag == "test" or online else self.args.batch_size
         loader = DataLoader(ds, batch_size=bsz, shuffle=flag == "train",
             num_workers=self.args.num_workers, drop_last=flag == "train")
         print(flag, len(ds)); return ds, loader
@@ -162,7 +166,7 @@ class ExpStreamBaseline(Exp_Basic):
             loss.backward(); self.opt_student.step(); self.prev_student = student_pred.detach()
             replay = self._sample_replay()
             if replay:
-                rx, ry, _ = replay; self.opt.zero_grad(); criterion(self.model(rx), ry).backward(); self.opt.step()
+                rx, ry, _ = replay; self.rebuttal_replay_draws = getattr(self, "rebuttal_replay_draws", 0) + len(rx); self.opt.zero_grad(); criterion(self.model(rx), ry).backward(); self.opt.step()
         elif self.method == "proceed":
             self.opt.zero_grad(); loss=criterion(self.model(x, mark), y); loss.backward(); self.opt.step()
             self.model.observe(x,y)
@@ -172,6 +176,7 @@ class ExpStreamBaseline(Exp_Basic):
                 replay=self._sample_replay()
                 if replay:
                     rx,ry,rm=replay; loss=loss+criterion(self.model(rx),ry)
+                    self.rebuttal_replay_draws = getattr(self, "rebuttal_replay_draws", 0) + len(rx)
             loss.backward(); self.opt.step(); self._store_grad()
         self.buffer.append((x.detach().clone(),y.detach().clone(),mark.detach().clone()))
 
@@ -264,8 +269,57 @@ class ExpStreamBaseline(Exp_Basic):
 
         return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
 
-    def test(self, setting):
-        _, loader=self._get_data("test")
+    def _dsof_partial_td_batch(self, queue, x, y, mark):
+        """Prospective DSOF adaptation using one new observation per fast update."""
+        preds = []
+        horizon = self.args.pred_len
+        for i in range(x.shape[0]):
+            context = x[i:i+1]
+            observation = self._current_observation(context).view(1, 1, -1)
+            previous = queue[-1] if queue else None
+            for record in queue:
+                record["observed"].append(observation.detach().clone())
+            if len(queue) == horizon:
+                mature = queue.popleft()
+                replay = self._sample_replay()
+                if replay:
+                    rx, ry, _ = replay
+                    self.model.train()
+                    self.opt.zero_grad()
+                    nn.functional.mse_loss(self.model(rx), ry).backward()
+                    self.opt.step()
+                    self.rebuttal_replay_draws += len(rx)
+                self.buffer.append((mature["x"], torch.cat(mature["observed"], dim=1), mature["mark"]))
+
+            self.model.eval()
+            self.student.eval()
+            with torch.no_grad():
+                teacher = self.model(context)
+                bootstrap = teacher + self.student(context)
+            if previous is not None:
+                self.student.train()
+                self.opt_student.zero_grad()
+                fitted = previous["teacher"] + self.student(previous["x"])
+                loss = nn.functional.mse_loss(fitted[:, :1], observation)
+                if horizon > 1:
+                    loss = loss + self.args.dsof_td_weight * nn.functional.mse_loss(
+                        fitted[:, 1:], bootstrap[:, :-1])
+                loss.backward()
+                self.opt_student.step()
+            self.student.eval()
+            with torch.no_grad():
+                preds.append(teacher + self.student(context))
+            queue.append({"x": context.detach().clone(), "mark": mark[i:i+1].detach().clone(),
+                          "teacher": teacher.detach(), "observed": []})
+        return torch.cat(preds, dim=0), y
+
+    def test(self, setting, *, split="test"):
+        _, loader = self._get_online_data(split)
+        partial_dsof = bool(getattr(self.args, "rebuttal_dsof_partial_td", False))
+        if partial_dsof and (self.method != "dsof" or not self.args.delay_fb
+                             or self.progressive_baseline_fb or self.online != "full"):
+            raise ValueError("DSOF partial TD requires dsof with the delayed-feedback queue")
+        self.rebuttal_replay_draws = 0
         if self.method == "proceed":
             self.model.freeze_backbone(True); self.opt=optim.Adam(self.model.adapter_parameters(),lr=self.args.proceed_online_lr)
         else:
@@ -309,6 +363,8 @@ class ExpStreamBaseline(Exp_Basic):
                 pred, y = self._progressive_online_batch(
                     progressive_manager, x, y, mark
                 )
+            elif partial_dsof:
+                pred, y = self._dsof_partial_td_batch(feedback_queue, x, y, mark)
             elif feedback_queue is not None:
                 pred, y = self._delayed_online_batch(feedback_queue, x, y, mark)
             else:

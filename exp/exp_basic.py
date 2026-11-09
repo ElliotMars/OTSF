@@ -14,13 +14,21 @@ class Exp_Basic(object):
     
     def _acquire_device(self):
         if self.args.use_gpu:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
+            if not getattr(self.args, "preserve_cuda_visible_devices", False):
+                os.environ["CUDA_VISIBLE_DEVICES"] = str(self.args.gpu) if not self.args.use_multi_gpu else self.args.devices
             device = torch.device('cuda:{}'.format(self.args.gpu))
             print('Use GPU: cuda:{}'.format(self.args.gpu))
         else:
             device = torch.device('cpu')
             print('Use CPU')
         return device
+
+    def _get_online_data(self, split):
+        if split == "test":
+            return self._get_data("test")
+        if split == "val":
+            return self._get_data("val", online=True)
+        raise ValueError(f"unsupported online evaluation split: {split}")
 
     def _get_data(self):
         pass

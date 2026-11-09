@@ -7,6 +7,11 @@ import torch.nn.functional as F
 
 
 MemoryKind = Literal["stable", "recovery"]
+VALIDITY_MODES = (
+    "full", "loss_only_gate_alignment_weighted", "pure_loss_only",
+    "high_align_guard_original_weight", "high_align_guard_weight_safe",
+)
+LOSS_ONLY_MODES = VALIDITY_MODES[1:3]
 CapabilityEvolution = Literal[
     "retained", "harmful_drift", "beneficial_or_neutral_evolution"
 ]
@@ -26,6 +31,7 @@ def classify_capability_evolution(
     alignment_threshold: float,
     degradation_margin: float = 0.0,
     eps: float = 1e-8,
+    *, mode: str = "full",
 ) -> CapabilityEvolutionDecision:
     """Classify representation drift by its historical performance direction."""
 
@@ -50,7 +56,13 @@ def classify_capability_evolution(
         > prediction_loss * (1.0 + degradation_margin) + eps
     )
     relative = (current_loss - prediction_loss) / (prediction_loss + eps)
-    if alignment >= alignment_threshold:
+    if mode not in VALIDITY_MODES:
+        raise ValueError(f"unknown validity mode: {mode}")
+    if mode in LOSS_ONLY_MODES:
+        category = ("harmful_drift" if degraded else "beneficial_or_neutral_evolution"
+                    if current_loss < prediction_loss - eps else "retained")
+        return CapabilityEvolutionDecision(category, degraded, relative)
+    if alignment >= alignment_threshold and (mode == "full" or not degraded):
         category: CapabilityEvolution = "retained"
     elif degraded:
         category = "harmful_drift"
@@ -93,6 +105,8 @@ class VersionedMemoryItem:
     last_observed_alignment: float = 1.0
     recovery_eligible: bool = True
     capability_evolution: CapabilityEvolution = "retained"
+    validity_mode: str = "full"
+    recovery_weight_floor: float = 0.1
 
     def __post_init__(self) -> None:
         self.sample_confidence = float(self.sample_confidence)
@@ -123,18 +137,16 @@ class VersionedMemoryItem:
     def refresh_credit(self) -> None:
         """Recompute confidence-aware long-term credit at current alignment."""
 
-        self.stable_credit = (
-            self.sample_confidence
-            * self.sample_responsibility
-            * self.last_alignment
-        )
-        self.recovery_credit = (
-            self.sample_confidence
-            * self.sample_responsibility
-            * (1.0 - self.last_alignment)
-            if self.recovery_eligible
-            else 0.0
-        )
+        stable_weight = self.last_alignment
+        recovery_weight = 1.0 - self.last_alignment
+        if self.validity_mode == "pure_loss_only":
+            stable_weight = recovery_weight = 1.0
+        elif (self.validity_mode == "high_align_guard_weight_safe"
+              and self.capability_evolution == "harmful_drift"):
+            recovery_weight = max(recovery_weight, self.recovery_weight_floor)
+        base_credit = self.sample_confidence * self.sample_responsibility
+        self.stable_credit = base_credit * stable_weight
+        self.recovery_credit = base_credit * recovery_weight if self.recovery_eligible else 0.0
         if not (
             math.isfinite(self.stable_credit)
             and math.isfinite(self.recovery_credit)
@@ -338,11 +350,15 @@ class ExpertMemoryManager:
         degradation_eps: float = 1e-8,
         capability_rebase_enabled: bool = True,
         recovery_enabled: bool = True,
+        validity_mode: str = "full",
     ) -> None:
         if num_experts <= 0:
             raise ValueError("num_experts must be positive")
         if max_recovery_attempts < 0:
             raise ValueError("max_recovery_attempts must be non-negative")
+        if validity_mode not in VALIDITY_MODES:
+            raise ValueError(f"unknown validity mode: {validity_mode}")
+        self.validity_mode = validity_mode
         self.num_experts = int(num_experts)
         self.responsibility_threshold = float(responsibility_threshold)
         self.alignment_threshold = float(alignment_threshold)
@@ -401,6 +417,8 @@ class ExpertMemoryManager:
             if item.last_alignment >= self.alignment_threshold
             else "recovery"
         )
+        if self.validity_mode != "full":
+            kind = "recovery" if item.capability_evolution == "harmful_drift" else "stable"
         if kind == "recovery" and not self.recovery_enabled:
             return None, BufferAddResult(
                 False, None, "recovery_disabled"
@@ -485,6 +503,7 @@ class ExpertMemoryManager:
             alignment_threshold=self.alignment_threshold,
             degradation_margin=self.recovery_degradation_margin,
             eps=self.degradation_eps,
+            mode=self.validity_mode,
         )
 
     def _maybe_rebase(
@@ -564,6 +583,8 @@ class ExpertMemoryManager:
                 self.version_awareness_enabled
                 and effective_alignment < self.alignment_threshold
             )
+            if self.validity_mode != "full" and decision is not None:
+                low_alignment = decision.category != "retained"
             if self.direction_awareness_enabled:
                 item.recovery_eligible = bool(
                     self.recovery_enabled
@@ -647,7 +668,7 @@ class ExpertMemoryManager:
             )
             item.recovery_eligible = not performance_recovered
             item.refresh_credit()
-            if performance_recovered or alignment_recovered:
+            if performance_recovered or (self.validity_mode == "full" and alignment_recovered):
                 removed = self.recovery_buffers[expert_id].remove(
                     item.sample_id
                 )
@@ -755,7 +776,7 @@ class ExpertMemoryManager:
         )
         item.recovery_eligible = not performance_recovered
         item.refresh_credit()
-        if performance_recovered or alignment_recovered:
+        if performance_recovered or (self.validity_mode == "full" and alignment_recovered):
             removed = buffer.remove(sample_id)
             if removed is None:
                 return "missing"

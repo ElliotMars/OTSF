@@ -36,7 +36,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         )
         self.progressive_protocol_diagnostics = None
 
-    def _get_data(self, flag):
+    def _get_data(self, flag, *, online=False):
         mapping = defaultdict(lambda: Dataset_Custom, {
             "ETTh1": Dataset_ETT_hour, "ETTh2": Dataset_ETT_hour,
             "ETTm1": Dataset_ETT_minute, "ETTm2": Dataset_ETT_minute,
@@ -47,8 +47,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             size=[self.args.seq_len, self.args.label_len, self.args.pred_len],
             features=self.args.features, target=self.args.target, inverse=self.args.inverse,
             timeenc=2, freq=self.args.freq, cols=self.args.cols,
+            **({"split_mode": self.args.split_mode} if hasattr(self.args, "split_mode") and flag != "pred" else {}),
+            **({"validation_source_rows": self.args.online_validation_source_rows}
+               if online and hasattr(self.args, "online_validation_source_rows") else {}),
         )
-        batch_size = self.args.test_bsz if flag == "test" else self.args.batch_size
+        batch_size = self.args.test_bsz if flag == "test" or online else self.args.batch_size
         loader = DataLoader(dataset, batch_size=batch_size, shuffle=flag == "train",
                             num_workers=self.args.num_workers, drop_last=flag == "train")
         print(flag, len(dataset))
@@ -252,8 +255,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
 
         return torch.cat(batch_preds, dim=0), torch.cat(batch_trues, dim=0)
 
-    def test(self, setting):
-        _, loader = self._get_data("test")
+    def test(self, setting, *, split="test"):
+        _, loader = self._get_online_data(split)
         self.model.freeze_backbone(True)
         self.opt_gate = optim.Adam(self.model.gate_parameters(), lr=self.args.dyname_online_lr)
         self.past = None

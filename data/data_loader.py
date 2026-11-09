@@ -7,6 +7,7 @@ from sklearn.preprocessing import StandardScaler as sklearn_StandardScaler
 
 from utils.tools import StandardScaler
 from utils.timefeatures import time_features
+from utils.rebuttal_splits import PAPER, CONVENTIONAL, ett_bounds
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -14,7 +15,8 @@ warnings.filterwarnings('ignore')
 class Dataset_ETT_hour(Dataset):
     def __init__(self, root_path, flag='train', delay_fb=False, size=None, 
                  features='S', data_path='ETTh1.csv', 
-                 target='OT', scale=True, inverse=False, timeenc=0, freq='h', cols=None):
+                 target='OT', scale=True, inverse=False, timeenc=0, freq='h', cols=None, *,
+                 validation_source_rows=None, split_mode=PAPER):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -29,6 +31,10 @@ class Dataset_ETT_hour(Dataset):
         assert flag in ['train', 'test', 'val']
         type_map = {'train':0, 'val':1, 'test':2}
         self.set_type = type_map[flag]
+        if validation_source_rows is not None and flag != "val":
+            raise ValueError("bounded CSV reading is only supported for validation")
+        self.validation_source_rows = validation_source_rows
+        self.split_mode = split_mode
         
         self.features = features
         self.target = target
@@ -43,13 +49,18 @@ class Dataset_ETT_hour(Dataset):
 
     def __read_data__(self):
         self.scaler = StandardScaler()
-        df_raw = pd.read_csv(os.path.join(self.root_path,
-                                          self.data_path))
+        train_end, val_end, test_end = ett_bounds(False, self.split_mode)
+        validation_end = val_end if self.validation_source_rows is not None else None
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path), nrows=validation_end)
+        if validation_end is not None and len(df_raw) != validation_end:
+            raise ValueError("CSV is shorter than the recorded ETT validation boundary")
 
         #border1s = [0, 12*30*24 - self.seq_len, 12*30*24+4*30*24 - self.seq_len]
         #border2s = [12*30*24, 12*30*24+4*30*24, 12*30*24+8*30*24]
-        border1s = [0, 4*30*24 - self.seq_len, 5*30*24 - self.seq_len]
-        border2s = [4*30*24, 5*30*24, 20*30*24]
+        if self.split_mode == CONVENTIONAL and len(df_raw) < (validation_end or test_end):
+            raise ValueError("ETT CSV is too short for conventional boundaries")
+        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
+        border2s = [train_end, val_end, test_end]
         
 
         border1 = border1s[self.set_type]
@@ -118,7 +129,8 @@ class Dataset_ETT_hour(Dataset):
 class Dataset_ETT_minute(Dataset):
     def __init__(self, root_path, flag='train', delay_fb=False, size=None, 
                  features='S', data_path='ETTm1.csv', 
-                 target='OT', scale=True, inverse=False, timeenc=0, freq='t', cols=None):
+                 target='OT', scale=True, inverse=False, timeenc=0, freq='t', cols=None, *,
+                 validation_source_rows=None, split_mode=PAPER):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -133,6 +145,10 @@ class Dataset_ETT_minute(Dataset):
         assert flag in ['train', 'test', 'val']
         type_map = {'train':0, 'val':1, 'test':2}
         self.set_type = type_map[flag]
+        if validation_source_rows is not None and flag != "val":
+            raise ValueError("bounded CSV reading is only supported for validation")
+        self.validation_source_rows = validation_source_rows
+        self.split_mode = split_mode
         
         self.features = features
         self.target = target
@@ -147,13 +163,18 @@ class Dataset_ETT_minute(Dataset):
 
     def __read_data__(self):
         self.scaler = StandardScaler()
-        df_raw = pd.read_csv(os.path.join(self.root_path,
-                                          self.data_path))
+        train_end, val_end, test_end = ett_bounds(True, self.split_mode)
+        validation_end = val_end if self.validation_source_rows is not None else None
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path), nrows=validation_end)
+        if validation_end is not None and len(df_raw) != validation_end:
+            raise ValueError("CSV is shorter than the recorded ETT validation boundary")
 
         #border1s = [0, 12*30*24*4 - self.seq_len, 12*30*24*4+4*30*24*4 - self.seq_len]
         #border2s = [12*30*24*4, 12*30*24*4+4*30*24*4, 12*30*24*4+8*30*24*4]
-        border1s = [0, 4*30*24 - self.seq_len, 5*30*24 - self.seq_len]
-        border2s = [4*30*24, 5*30*24, 20*30*24]
+        if self.split_mode == CONVENTIONAL and len(df_raw) < (validation_end or test_end):
+            raise ValueError("ETT CSV is too short for conventional boundaries")
+        border1s = [0, train_end - self.seq_len, val_end - self.seq_len]
+        border2s = [train_end, val_end, test_end]
 
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
@@ -220,7 +241,8 @@ class Dataset_ETT_minute(Dataset):
 class Dataset_Custom(Dataset):
     def __init__(self, root_path, flag='train', delay_fb=False, size=None, 
                  features='S', data_path='ETTh1.csv', 
-                 target='OT', scale=True, inverse=False, timeenc=0, freq='h', cols=None):
+                 target='OT', scale=True, inverse=False, timeenc=0, freq='h', cols=None, *,
+                 validation_source_rows=None, split_mode=PAPER):
         # size [seq_len, label_len, pred_len]
         # info
         if size == None:
@@ -235,6 +257,11 @@ class Dataset_Custom(Dataset):
         assert flag in ['train', 'test', 'val']
         type_map = {'train':0, 'val':1, 'test':2}
         self.set_type = type_map[flag]
+        if validation_source_rows is not None and flag != "val":
+            raise ValueError("bounded CSV reading is only supported for validation")
+        self.validation_source_rows = validation_source_rows
+        if split_mode != PAPER:
+            raise ValueError("conventional ETT split requires an ETT loader")
         
         self.features = features
         self.target = target
@@ -249,8 +276,12 @@ class Dataset_Custom(Dataset):
 
     def __read_data__(self):
         self.scaler = StandardScaler()
-        df_raw = pd.read_csv(os.path.join(self.root_path,
-                                          self.data_path))
+        total_rows = self.validation_source_rows
+        validation_end = total_rows - int(total_rows * 0.75) if total_rows is not None else None
+        df_raw = pd.read_csv(os.path.join(self.root_path, self.data_path), nrows=validation_end)
+        if validation_end is not None and len(df_raw) != validation_end:
+            raise ValueError("CSV is shorter than the recorded validation boundary")
+        total_rows = len(df_raw) if total_rows is None else total_rows
         '''
         df_raw.columns: ['date', ...(other features), target feature]
         '''
@@ -263,11 +294,11 @@ class Dataset_Custom(Dataset):
             cols = list(df_raw.columns); cols.remove(self.target); cols.remove('date')
         df_raw = df_raw[['date']+cols+[self.target]]
 
-        num_train = int(len(df_raw)*0.2)
-        num_test = int(len(df_raw)*0.75)
-        num_vali = len(df_raw) - num_train - num_test
-        border1s = [0, num_train-self.seq_len, len(df_raw)-num_test-self.seq_len]
-        border2s = [num_train, num_train+num_vali, len(df_raw)]
+        num_train = int(total_rows*0.2)
+        num_test = int(total_rows*0.75)
+        num_vali = total_rows - num_train - num_test
+        border1s = [0, num_train-self.seq_len, total_rows-num_test-self.seq_len]
+        border2s = [num_train, num_train+num_vali, total_rows]
         border1 = border1s[self.set_type]
         border2 = border2s[self.set_type]
         

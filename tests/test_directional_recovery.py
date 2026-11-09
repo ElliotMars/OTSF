@@ -719,3 +719,40 @@ def test_legacy_item_falls_back_to_original_prediction_loss() -> None:
 
     assert item.get_reference_capability_loss() == pytest.approx(1.0)
     assert item.reference_capability_loss == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("mode,expected_credit", [
+    ("loss_only_gate_alignment_weighted", 0.),
+    ("pure_loss_only", 1.),
+    ("high_align_guard_original_weight", 0.),
+    ("high_align_guard_weight_safe", .1),
+])
+def test_rebuttal_high_alignment_drift_admits_and_recovers(mode, expected_credit):
+    exp = _builder_experiment(margin=.05)
+    exp.validity_mode = mode
+    manager = _manager(margin=.05)
+    manager.validity_mode = mode
+    sketch = torch.tensor([[1., 0.]])
+    item, = exp._build_memory_candidates(_record(), torch.tensor([1.]), torch.tensor([1.]),
+                                         timestamp=11, current_loss=torch.tensor([2.]), current_sketch=sketch)
+    assert item.capability_evolution == "harmful_drift"
+    assert item.recovery_credit == pytest.approx(expected_credit)
+    assert manager.add_candidate(item) == "recovery"
+    assert manager.update_recovery_result(0, item.sample_id, 1., 2., current_sketch=sketch[0]) == "recovery"
+    assert item.get_reference_capability_loss() == 1.
+    assert manager.update_recovery_result(0, item.sample_id, 1., .8, current_sketch=sketch[0]) == "promoted_performance"
+    assert item.get_reference_capability_loss() == .8
+    assert item.prediction_time_loss == 1.
+
+
+def test_rebuttal_pure_loss_only_rebases_high_alignment_improvement():
+    exp = _builder_experiment()
+    exp.validity_mode = "pure_loss_only"
+    new_sketch = torch.tensor([[0., 1.]])
+    item, = exp._build_memory_candidates(_record(), torch.tensor([.9]), torch.tensor([2.]),
+                                         timestamp=11, current_loss=torch.tensor([1.]), current_sketch=new_sketch)
+    assert item.capability_evolution == "beneficial_or_neutral_evolution"
+    assert item.stable_credit == 1.
+    assert item.get_reference_capability_loss() == 1.
+    assert item.prediction_time_loss == 2.
+    torch.testing.assert_close(item.prediction_capability_sketch, new_sketch[0])

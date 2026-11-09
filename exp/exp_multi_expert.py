@@ -385,6 +385,8 @@ class net(nn.Module):
     ) -> torch.Tensor:
         """Return effective gates while preserving legacy channel shape."""
         effective = self._sparsify_prior(self._compute_prior(x, x_mark))
+        if getattr(self, "rebuttal_uniform_online", False):
+            effective = torch.full_like(effective, 1.0 / self.num_experts)
         if self.router_granularity == "channel":
             return effective[:, 0]
         return effective
@@ -643,6 +645,14 @@ class Exp_TS2VecSupervised(Exp_Basic):
         recovery_capacity = int(getattr(args, "recovery_buffer_size", 32))
         if not self.recovery_enabled:
             recovery_capacity = 0
+        self.validity_mode = getattr(args, "rebuttal_validity_mode", "full")
+        self.rebuttal_moe_mode = getattr(args, "rebuttal_moe_mode", None)
+        self.rebuttal_moe_history = deque(maxlen=32) if self.rebuttal_moe_mode else None
+        self.rebuttal_moe_replay = int(getattr(args, "rebuttal_moe_replay", 0))
+        if (self.rebuttal_moe_mode not in (None, "matched", "uniform")
+                or not 0 <= self.rebuttal_moe_replay <= 32
+                or (self.rebuttal_moe_mode and not self.progressive_fb)):
+            raise ValueError("invalid prospective MoE control configuration")
         self.memory_manager = ExpertMemoryManager(
             num_experts=self.model.num_experts,
             stable_capacity=stable_capacity,
@@ -671,6 +681,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
             degradation_eps=self.min_credit_eps,
             capability_rebase_enabled=self.capability_rebase_enabled,
             recovery_enabled=self.recovery_enabled,
+            validity_mode=self.validity_mode,
         )
         self.subspace_scope = str(getattr(args, "subspace_scope", "regressor"))
         if self.subspace_scope != "regressor":
@@ -941,7 +952,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self._set_optimizer_lr(self.opt_router, self.base_learning_rate_router)
         return self.model
 
-    def _get_data(self, flag):
+    def _get_data(self, flag, *, online=False):
         args = self.args
 
         data_dict_ = {
@@ -958,7 +969,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
         Data = data_dict[self.args.data]
         timeenc = 2
 
-        if flag == "test":
+        if flag == "test" or online:
             shuffle_flag = False
             drop_last = False
             batch_size = args.test_bsz
@@ -992,6 +1003,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             timeenc=timeenc,
             freq=freq,
             cols=args.cols,
+            **({"split_mode": args.split_mode} if hasattr(args, "split_mode") and flag != "pred" else {}),
+            **({"validation_source_rows": args.online_validation_source_rows}
+               if online and hasattr(args, "online_validation_source_rows") else {}),
         )
         print(flag, len(data_set))
         data_loader = DataLoader(
@@ -1623,6 +1637,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 if self.online_correction_enabled
                 else self.model._sparsify_prior(horizon_prior)
             )
+            if getattr(self, "rebuttal_moe_mode", None) == "uniform":
+                effective_weights = torch.full_like(effective_weights, 1.0 / self.model.num_experts)
             outputs, representations = self.model.forward_experts(
                 x, x_mark, return_repr=True
             )
@@ -1670,6 +1686,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
             mixture_prediction=mixture_hc,
             capability_sketch=capability_sketch[0],
         )
+        recorder = getattr(self, "rebuttal_recorder", None)
+        if recorder is not None:
+            record.metadata["rebuttal_proxy_snapshot"] = recorder.snapshot(representations)
         record.metadata["expert_update_count_at_prediction"] = int(
             self.expert_update_count
         )
@@ -1875,6 +1894,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     getattr(self, "recovery_degradation_margin", 0.0)
                 ),
                 eps=self.min_credit_eps,
+                mode=getattr(self, "validity_mode", "full"),
             )
             for expert_id in range(self.model.num_experts)
         ]
@@ -1960,6 +1980,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 oracle["gap_to_all_expert_oracle"]
             ),
         }
+        recorder = getattr(self, "rebuttal_recorder", None)
+        if recorder is not None:
+            diagnostic["rebuttal_proxies"] = recorder.compare(
+                record, current_representations, prediction_expert, current_prediction
+            )
         self.credit_diagnostics.append(diagnostic)
         self.credit_diagnostic_total_count += 1
         record.metadata["version_diagnostic"] = diagnostic
@@ -2079,6 +2104,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     getattr(self, "recovery_degradation_margin", 0.0)
                 ),
                 eps=float(getattr(self, "min_credit_eps", 1e-8)),
+                mode=getattr(self, "validity_mode", "full"),
             )
             effective_alignment = (
                 observed_alignment
@@ -2089,6 +2115,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 self.version_awareness_enabled
                 and effective_alignment < self.alignment_threshold
             )
+            if getattr(self, "validity_mode", "full") != "full":
+                low_alignment = decision.category != "retained"
             recovery_eligible = bool(
                 self.recovery_enabled
                 and (
@@ -2157,18 +2185,22 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     last_observed_alignment=observed_alignment,
                     recovery_eligible=recovery_eligible,
                     capability_evolution=decision.category,
+                    validity_mode=getattr(self, "validity_mode", "full"),
                 )
             )
         return candidates
 
     def _commit_memory_candidates(
         self, candidates: List[VersionedMemoryItem]
-    ) -> None:
+    ) -> dict[int, str]:
+        admitted = {}
         recovery_capacity_evictions = 0
         directional_admissions = 0
         rebased_stable_admissions = 0
         for item in candidates:
             kind, result = self.memory_manager.add_candidate_with_result(item)
+            if kind is not None:
+                admitted[item.expert_id] = kind
             if (
                 kind == "recovery"
                 and getattr(
@@ -2206,6 +2238,7 @@ class Exp_TS2VecSupervised(Exp_Basic):
                 drop_count=recovery_capacity_evictions,
             )
         self._update_memory_diagnostics()
+        return admitted
 
     def _transport_credit_to_memory(
         self,
@@ -2263,9 +2296,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
             sample_id: index for index, sample_id in enumerate(sample_ids)
         }
 
+        recorder = getattr(self, "rebuttal_recorder", None)
+
         def evaluator(
             expert_id: int, item: VersionedMemoryItem
-        ) -> tuple[float, float]:
+        ) -> tuple[float, float, torch.Tensor]:
             index = sample_index[item.sample_id]
             current_sketch = sketches[index, expert_id]
             old_sketch = item.normalized_sketch.float().to(self.device)
@@ -2284,11 +2319,12 @@ class Exp_TS2VecSupervised(Exp_Basic):
             )
             prediction = predictions[index, expert_id]
             loss = (prediction - target).pow(2).mean()
-            return (
-                float(alignment.item()),
-                float(loss.item()),
-                current_sketch.detach(),
-            )
+            observed_alignment, observed_loss = float(alignment.item()), float(loss.item())
+            if recorder is not None:
+                memory_kind = ("recovery" if self.memory_manager.recovery_buffers[expert_id].contains(item.sample_id)
+                               else "stable")
+                recorder.reassessment(timestamp, item, memory_kind, observed_alignment, observed_loss)
+            return observed_alignment, observed_loss, current_sketch.detach()
 
         return self.memory_manager.refresh(
             evaluator, timestamp=timestamp, count_recovery_attempts=False
@@ -2378,6 +2414,9 @@ class Exp_TS2VecSupervised(Exp_Basic):
         )
         if memory_due or subspace_due:
             stats = self._refresh_expert_memory(timestamp)
+            recorder = getattr(self, "rebuttal_recorder", None)
+            if recorder is not None:
+                recorder.refresh(timestamp, stats)
             protection_deactivated = False
             for expert_id, stable_buffer in enumerate(
                 self.memory_manager.stable_buffers
@@ -2455,6 +2494,15 @@ class Exp_TS2VecSupervised(Exp_Basic):
     ) -> None:
         """Learn with the old basis, then make the sample future evidence."""
 
+        history = getattr(self, "rebuttal_moe_history", None)
+        if history is not None:
+            if not completed.is_complete:
+                raise RuntimeError("MoE replay can only consume mature records")
+            target = completed.matured_targets.unsqueeze(0)
+            self._ol_one_batch(dataset, completed.x, target, completed.x_mark)
+            history.append((completed.x, completed.x_mark, target))
+            self.completed_record_count += 1
+            return
         checker = getattr(self, "online_checker", None)
         if checker is not None:
             checker.begin_completed(completed.origin, origin)
@@ -2499,7 +2547,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
         if checker is not None:
             checker.expert_updated(completed.origin, origin)
             checker.before_memory_commit(completed.origin, origin)
-        self._commit_memory_candidates(candidates)
+        admitted = self._commit_memory_candidates(candidates)
+        recorder = getattr(self, "rebuttal_recorder", None)
+        if recorder is not None:
+            recorder.maturity(completed, origin, candidates, admitted)
         self.completed_record_count += 1
         self._periodic_memory_and_subspace_refresh(timestamp=origin)
 
@@ -2615,7 +2666,8 @@ class Exp_TS2VecSupervised(Exp_Basic):
             if checker is not None:
                 checker.feedback(events, origin)
             self._update_feedback_diagnostics(events)
-            self._update_router_from_partial_feedback(events)
+            if getattr(self, "rebuttal_moe_mode", None) != "uniform":
+                self._update_router_from_partial_feedback(events)
 
             for completed in completed_records:
                 self._learn_then_commit_completed_record(
@@ -2653,6 +2705,11 @@ class Exp_TS2VecSupervised(Exp_Basic):
         """Reset mutable stream state without changing weights or optimizer state."""
 
         self.online_buffer.clear()
+        history = getattr(self, "rebuttal_moe_history", None)
+        if history is not None:
+            history.clear()
+        self.rebuttal_replay_draws = 0
+        self.rebuttal_replay_records = 0
         self.online_step = 0
         self.prev_online_mse = None
         self.online_mse_ema = None
@@ -2694,9 +2751,13 @@ class Exp_TS2VecSupervised(Exp_Basic):
         self.diagnostics.update(**self.subspace_protector.metrics())
         self._update_memory_diagnostics()
 
-    def test(self, setting):
+    def test(self, setting, *, split="test"):
         self._prepare_test_start_state()
-        test_data, test_loader = self._get_data(flag="test")
+        if getattr(self, "rebuttal_moe_mode", None) == "uniform":
+            self.model.rebuttal_uniform_online = True
+            for parameter in self.router_params:
+                parameter.requires_grad_(False)
+        test_data, test_loader = self._get_online_data(split)
 
         self.model.eval()
         self.model.set_router_mode(True)
@@ -3238,6 +3299,21 @@ class Exp_TS2VecSupervised(Exp_Basic):
             recovery_batches
         )
         total_loss = supervised_loss + recovery_loss
+        history = getattr(self, "rebuttal_moe_history", None)
+        if history and self.rebuttal_moe_replay:
+            replay = list(history)[-self.rebuttal_moe_replay:]
+            xs, marks, targets = (torch.cat(column).float().to(self.device) for column in zip(*replay))
+            with self._fsnet_state_updates(False):
+                replay_outputs = self.model.forward_experts(xs, marks)
+            replay_loss = self._independent_expert_mse(replay_outputs, targets.flatten(1))
+            total_loss = total_loss + self.recovery_loss_weight * replay_loss
+            self.rebuttal_replay_records += len(replay)
+            self.rebuttal_replay_draws += len(replay) * self.model.num_experts
+        if recovery_batches:
+            self.rebuttal_replay_draws = getattr(self, "rebuttal_replay_draws", 0) + sum(
+                len(batch["items"]) for batch in recovery_batches)
+            self.rebuttal_replay_records = getattr(self, "rebuttal_replay_records", 0) + len({
+                item.sample_id for batch in recovery_batches for item in batch["items"]})
         if not bool(torch.isfinite(total_loss).item()):
             raise FloatingPointError("Expert online loss is not finite")
         total_loss.backward()
@@ -3444,9 +3520,10 @@ class Exp_TS2VecSupervised(Exp_Basic):
                     dynamic_alpha,
                     active_recovery,
                 )
-                router_result = self._run_full_router_update(
-                    x_t, x_mark_t, y_t
-                )
+                if getattr(self, "rebuttal_moe_mode", None) == "uniform":
+                    router_result = {"prediction": expert_result["prediction"], "gradient_norm": 0.0}
+                else:
+                    router_result = self._run_full_router_update(x_t, x_mark_t, y_t)
                 if prediction is None:
                     prediction = expert_result["prediction"]
                 if self.adaptive_controller == "dynamic":
